@@ -4,9 +4,12 @@ import * as NodePath from "node:path";
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as Data from "effect/Data";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 
 import { HostProcessEnvironment, HostProcessPlatform } from "./hostProcess.ts";
 import * as Context from "effect/Context";
@@ -43,12 +46,23 @@ export type CommandAvailabilityChecker = (
   options?: CommandAvailabilityOptions,
 ) => Effect.Effect<boolean, never, FileSystem.FileSystem | Path.Path>;
 
+export interface CommandDiscoveryOptions extends CommandAvailabilityOptions {
+  readonly timeout: Duration.Input;
+}
+
+export interface CommandDiscoveryResult {
+  readonly available: ReadonlySet<string>;
+  readonly complete: boolean;
+}
+
 export class CommandResolutionError extends Data.TaggedError("CommandResolutionError")<{
   readonly command: string;
   readonly reason: "not-found";
 }> {}
 
 const WINDOWS_SHELL_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
+const COMMAND_DISCOVERY_CONCURRENCY = 8;
+const PORTABLE_COMMAND_DISCOVERY_CONCURRENCY = 32;
 
 /**
  * Escapes a single argument for `cmd.exe` shell mode (`spawn(..., { shell: true })`
@@ -606,6 +620,149 @@ export const isCommandAvailable = Effect.fn("shell.isCommandAvailable")(function
     Effect.as(true),
     Effect.catchTag("CommandResolutionError", () => Effect.succeed(false)),
   );
+});
+
+const discoverWindowsPathEntry = Effect.fn("shell.discoverWindowsPathEntry")(function* (
+  pathEntry: string,
+  commandsByExecutableName: ReadonlyMap<string, ReadonlySet<string>>,
+  availableRef: Ref.Ref<ReadonlySet<string>>,
+): Effect.fn.Return<boolean, never, FileSystem.FileSystem | Path.Path> {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const directory = yield* fileSystem.readDirectory(pathEntry).pipe(
+    Effect.map((entries) => ({ entries, complete: true })),
+    Effect.catch((error) =>
+      Effect.succeed({
+        entries: [] as ReadonlyArray<string>,
+        complete: error.reason._tag === "NotFound",
+      }),
+    ),
+  );
+
+  let complete = directory.complete;
+  for (const entry of directory.entries) {
+    const commands = commandsByExecutableName.get(entry.toLowerCase());
+    if (commands === undefined) {
+      continue;
+    }
+
+    const stat = yield* fileSystem.stat(path.join(pathEntry, entry)).pipe(
+      Effect.map(Option.some),
+      Effect.catch((error) => {
+        if (error.reason._tag !== "NotFound") {
+          complete = false;
+        }
+        return Effect.succeed(Option.none());
+      }),
+    );
+    if (Option.isNone(stat)) {
+      continue;
+    }
+    if (stat.value.type !== "File") {
+      continue;
+    }
+
+    yield* Ref.update(availableRef, (available) => {
+      const updated = new Set(available);
+      for (const command of commands) {
+        updated.add(command);
+      }
+      return updated;
+    });
+  }
+
+  return complete;
+});
+
+const discoverAvailableWindowsCommands = Effect.fn("shell.discoverAvailableWindowsCommands")(
+  function* (
+    commands: ReadonlyArray<string>,
+    env: NodeJS.ProcessEnv,
+    availableRef: Ref.Ref<ReadonlySet<string>>,
+  ): Effect.fn.Return<boolean, never, FileSystem.FileSystem | Path.Path> {
+    const path = yield* Path.Path;
+    const windowsPathExtensions = resolveWindowsPathExtensions(env);
+    const commandsByExecutableName = new Map<string, Set<string>>();
+
+    for (const command of commands) {
+      for (const candidate of resolveCommandCandidates(
+        command,
+        "win32",
+        windowsPathExtensions,
+        path.extname,
+      )) {
+        const executableName = candidate.toLowerCase();
+        const aliases = commandsByExecutableName.get(executableName);
+        if (aliases === undefined) {
+          commandsByExecutableName.set(executableName, new Set([command]));
+        } else {
+          aliases.add(command);
+        }
+      }
+    }
+
+    const results = yield* Effect.forEach(
+      resolvePathEnvironmentVariable(env)
+        .split(pathDelimiterForPlatform("win32"))
+        .map((entry) => stripWrappingQuotes(entry.trim()))
+        .filter((entry) => entry.length > 0),
+      (pathEntry) => discoverWindowsPathEntry(pathEntry, commandsByExecutableName, availableRef),
+      { concurrency: COMMAND_DISCOVERY_CONCURRENCY },
+    );
+
+    return results.every((complete) => complete);
+  },
+);
+
+const discoverAvailablePortableCommands = Effect.fn("shell.discoverAvailablePortableCommands")(
+  function* (
+    commands: ReadonlyArray<string>,
+    env: NodeJS.ProcessEnv | undefined,
+    availableRef: Ref.Ref<ReadonlySet<string>>,
+  ): Effect.fn.Return<boolean, never, FileSystem.FileSystem | Path.Path> {
+    const commandAvailable = yield* CommandAvailability;
+    yield* Effect.forEach(
+      commands,
+      (command) =>
+        commandAvailable(command, env === undefined ? {} : { env }).pipe(
+          Effect.tap((available) =>
+            available
+              ? Ref.update(availableRef, (current) => new Set(current).add(command))
+              : Effect.void,
+          ),
+        ),
+      { concurrency: PORTABLE_COMMAND_DISCOVERY_CONCURRENCY },
+    );
+    return true;
+  },
+);
+
+export const discoverAvailableCommands = Effect.fn("shell.discoverAvailableCommands")(function* (
+  commands: ReadonlyArray<string>,
+  options: CommandDiscoveryOptions,
+): Effect.fn.Return<CommandDiscoveryResult, never, FileSystem.FileSystem | Path.Path> {
+  const platform = yield* HostProcessPlatform;
+  const uniqueCommands = Array.from(new Set(commands));
+  const availableRef = yield* Ref.make<ReadonlySet<string>>(new Set());
+
+  const scan =
+    platform === "win32"
+      ? discoverAvailableWindowsCommands(
+          uniqueCommands,
+          options.env ?? (yield* HostProcessEnvironment),
+          availableRef,
+        )
+      : discoverAvailablePortableCommands(uniqueCommands, options.env, availableRef);
+
+  const complete = yield* scan.pipe(
+    Effect.timeoutOption(options.timeout),
+    Effect.map(Option.getOrElse(() => false)),
+  );
+
+  return {
+    available: yield* Ref.get(availableRef),
+    complete,
+  };
 });
 
 export function resolveKnownWindowsCliDirs(env: NodeJS.ProcessEnv): ReadonlyArray<string> {

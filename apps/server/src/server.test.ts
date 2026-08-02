@@ -593,7 +593,11 @@ const buildAppUnderTest = (options?: {
       ),
       Layer.provide(
         Layer.mock(ExternalLauncher.ExternalLauncher)({
-          resolveAvailableEditors: () => Effect.succeed([]),
+          resolveAvailableEditors: () =>
+            Effect.succeed({
+              editors: [],
+              complete: true,
+            }),
           ...options?.layers?.externalLauncher,
         }),
       ),
@@ -3947,8 +3951,39 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.equal(response.environment.environmentId, testEnvironmentDescriptor.environmentId);
       assert.equal(response.auth.policy, "desktop-managed-local");
+      assert.equal(response.availableEditorsComplete, true);
       assert.equal(response.shellResumeCompletionMarker, true);
       assert.equal(response.threadResumeCompletionMarker, true);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("preserves incomplete editor discovery in server config", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({
+        layers: {
+          externalLauncher: {
+            resolveAvailableEditors: () =>
+              Effect.succeed({
+                editors: [],
+                complete: false,
+              }),
+          },
+        },
+      });
+
+      const { cookie } = yield* bootstrapBrowserSession();
+      assert.isDefined(cookie);
+
+      const wsUrl = appendSessionCookieToWsUrl(
+        yield* getWsServerUrl("/ws", { authenticated: false }),
+        cookie?.split(";")[0] ?? "",
+      );
+      const response = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) => client[WS_METHODS.serverGetConfig]({})),
+      );
+
+      assert.deepEqual(response.availableEditors, []);
+      assert.equal(response.availableEditorsComplete, false);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -3963,9 +3998,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       yield* TestClock.adjust(Duration.seconds(5));
 
-      const availableEditors = yield* Fiber.join(responseFiber);
+      const editorDiscovery = yield* Fiber.join(responseFiber);
       yield* Deferred.await(discoveryInterrupted);
-      assert.deepEqual(availableEditors, []);
+      assert.deepEqual(editorDiscovery, {
+        editors: [],
+        complete: false,
+      });
     }),
   );
 
@@ -4522,6 +4560,77 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         payload: { keybindings: [], issues: [] },
       });
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("retries incomplete editor discovery without clobbering live config updates", () =>
+    Effect.gen(function* () {
+      const retryStarted = yield* Deferred.make<void>();
+      const settingsUpdateDelivered = yield* Deferred.make<void>();
+      const updatedSettings = {
+        ...DEFAULT_SERVER_SETTINGS,
+        enableAssistantStreaming: true,
+      };
+      let discoveryCalls = 0;
+      yield* buildAppUnderTest({
+        layers: {
+          externalLauncher: {
+            resolveAvailableEditors: () =>
+              Effect.gen(function* () {
+                discoveryCalls += 1;
+                if (discoveryCalls === 1) {
+                  return {
+                    editors: [],
+                    complete: false,
+                  };
+                }
+                yield* Deferred.succeed(retryStarted, undefined);
+                yield* Deferred.await(settingsUpdateDelivered);
+                return {
+                  editors: [EditorId.make("vscode")],
+                  complete: true,
+                };
+              }),
+          },
+          serverSettings: {
+            streamChanges: Stream.concat(
+              Stream.fromEffect(Deferred.await(retryStarted)).pipe(Stream.drain),
+              Stream.concat(
+                Stream.succeed(updatedSettings),
+                Stream.fromEffect(Deferred.succeed(settingsUpdateDelivered, undefined)).pipe(
+                  Stream.drain,
+                ),
+              ),
+            ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const events = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.subscribeServerConfig]({}).pipe(Stream.take(3), Stream.runCollect),
+        ),
+      );
+
+      const [initial, settingsUpdated, refreshed] = Array.from(events);
+      assert.equal(initial?.type, "snapshot");
+      if (initial?.type === "snapshot") {
+        assert.deepEqual(initial.config.availableEditors, []);
+        assert.equal(initial.config.availableEditorsComplete, false);
+      }
+      assert.deepEqual(settingsUpdated, {
+        version: 1,
+        type: "settingsUpdated",
+        payload: { settings: updatedSettings },
+      });
+      assert.equal(refreshed?.type, "snapshot");
+      if (refreshed?.type === "snapshot") {
+        assert.deepEqual(refreshed.config.availableEditors, [EditorId.make("vscode")]);
+        assert.equal(refreshed.config.availableEditorsComplete, true);
+        assert.deepEqual(refreshed.config.settings, updatedSettings);
+      }
+      assert.equal(discoveryCalls, 2);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
   );
 
   it.effect("routes websocket resource telemetry through the subscription", () =>

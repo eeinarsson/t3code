@@ -1,3 +1,4 @@
+import { useAtomValue } from "@effect/atom-react";
 import { EditorId, type EnvironmentId, type ResolvedKeybindingsConfig } from "@t3tools/contracts";
 import { memo, useCallback, useEffect, useMemo } from "react";
 import { isOpenFavoriteEditorShortcut, shortcutLabelForCommand } from "../../keybindings";
@@ -32,6 +33,7 @@ import {
   WebStormIcon,
 } from "../JetBrainsIcons";
 import { cn, isMacPlatform, isWindowsPlatform } from "~/lib/utils";
+import { serverEnvironment } from "~/state/server";
 import { shellEnvironment } from "~/state/shell";
 import { useAtomCommand } from "~/state/use-atom-command";
 
@@ -183,6 +185,12 @@ function getOpenInIconClass(kind: OpenInOption["kind"]) {
   return cn(kind === "brand" ? "text-foreground opacity-100" : "text-muted-foreground");
 }
 
+export function resolveEmptyEditorMessage(discoveryComplete: boolean | undefined): string {
+  return discoveryComplete === true
+    ? "No installed editors found"
+    : "Couldn’t check for installed editors";
+}
+
 export const OpenInPicker = memo(function OpenInPicker({
   environmentId,
   keybindings,
@@ -198,6 +206,7 @@ export const OpenInPicker = memo(function OpenInPicker({
   compact?: boolean;
   enableShortcut?: boolean;
 }) {
+  const serverConfig = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const openInEditorMutation = useAtomCommand(shellEnvironment.openInEditor, "open in editor");
   const [preferredEditor, setPreferredEditor] = usePreferredEditor(availableEditors);
   const options = useMemo(
@@ -296,7 +305,11 @@ export const OpenInPicker = memo(function OpenInPicker({
           <ChevronDownIcon aria-hidden="true" className="size-4" />
         </MenuTrigger>
         <MenuPopup align="end">
-          {options.length === 0 && <MenuItem disabled>No installed editors found</MenuItem>}
+          {options.length === 0 && (
+            <MenuItem disabled>
+              {resolveEmptyEditorMessage(serverConfig?.availableEditorsComplete)}
+            </MenuItem>
+          )}
           {options.map(({ label, Icon, value, kind }) => (
             <MenuItem key={value} onClick={() => openInEditor(value)}>
               <Icon aria-hidden="true" className={getOpenInIconClass(kind)} />

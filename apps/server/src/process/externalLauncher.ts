@@ -18,15 +18,23 @@ import {
   type LaunchEditorInput,
 } from "@t3tools/contracts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
-import { isCommandAvailable, resolveSpawnCommand } from "@t3tools/shared/shell";
+import {
+  discoverAvailableCommands,
+  isCommandAvailable,
+  resolveSpawnCommand,
+} from "@t3tools/shared/shell";
+import * as Cache from "effect/Cache";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Encoding from "effect/Encoding";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
@@ -63,6 +71,11 @@ interface TargetPathAndPosition {
   readonly column: Option.Option<string>;
 }
 
+export interface EditorDiscoveryResult {
+  readonly editors: ReadonlyArray<EditorId>;
+  readonly complete: boolean;
+}
+
 const TARGET_WITH_POSITION_PATTERN = /^(.*?):(\d+)(?::(\d+))?$/;
 const POWERSHELL_ARGUMENTS_PREFIX = [
   "-NoProfile",
@@ -78,6 +91,10 @@ const DETACHED_IGNORE_STDIO_OPTIONS = {
   stdout: "ignore",
   stderr: "ignore",
 } as const satisfies ChildProcess.CommandOptions;
+
+const EDITOR_DISCOVERY_TIMEOUT = Duration.seconds(3);
+const EDITOR_DISCOVERY_CACHE_TTL = Duration.minutes(1);
+const EDITOR_DISCOVERY_CACHE_KEY = "available-editors" as const;
 
 const compactEnv = (input: Record<string, Option.Option<string>>): NodeJS.ProcessEnv =>
   Object.fromEntries(
@@ -263,26 +280,32 @@ function buildBrowserLaunch(
 const buildAvailableEditors = Effect.fn("externalLauncher.buildAvailableEditors")(function* (
   platform: NodeJS.Platform,
   env: NodeJS.ProcessEnv,
-): Effect.fn.Return<ReadonlyArray<EditorId>, never, FileSystem.FileSystem | Path.Path> {
-  const available: EditorId[] = [];
+): Effect.fn.Return<EditorDiscoveryResult, never, FileSystem.FileSystem | Path.Path> {
+  const fileManagerCommand = fileManagerCommandForPlatform(platform);
+  const discovery = yield* discoverAvailableCommands(
+    [...EDITORS.flatMap((editor) => editor.commands ?? []), fileManagerCommand],
+    {
+      env,
+      timeout: EDITOR_DISCOVERY_TIMEOUT,
+    },
+  );
 
-  for (const editor of EDITORS) {
-    if (editor.commands === null) {
-      const command = fileManagerCommandForPlatform(platform);
-      if (yield* isCommandAvailable(command, { env })) {
-        available.push(editor.id);
-      }
-      continue;
-    }
-
-    const command = yield* resolveAvailableCommand(editor.commands, env);
-    if (Option.isSome(command)) {
-      available.push(editor.id);
-    }
-  }
-
-  return available;
+  return {
+    editors: EDITORS.flatMap((editor) => {
+      const editorCommands = editor.commands ?? [fileManagerCommand];
+      return editorCommands.some((command) => discovery.available.has(command)) ? [editor.id] : [];
+    }),
+    complete: discovery.complete,
+  };
 });
+
+function mergeEditorLists(
+  current: ReadonlyArray<EditorId>,
+  previous: ReadonlyArray<EditorId>,
+): ReadonlyArray<EditorId> {
+  const available = new Set([...current, ...previous]);
+  return EDITORS.flatMap((editor) => (available.has(editor.id) ? [editor.id] : []));
+}
 
 const resolveBrowserLaunch = Effect.fn("externalLauncher.resolveBrowserLaunch")(function* (
   target: string,
@@ -304,7 +327,7 @@ const resolveAvailableEditors = Effect.fn("externalLauncher.resolveAvailableEdit
 export class ExternalLauncher extends Context.Service<
   ExternalLauncher,
   {
-    readonly resolveAvailableEditors: () => Effect.Effect<ReadonlyArray<EditorId>>;
+    readonly resolveAvailableEditors: () => Effect.Effect<EditorDiscoveryResult>;
     /** Launch a URL target in the default browser. */
     readonly launchBrowser: (target: string) => Effect.Effect<void, ExternalLauncherError>;
     /**
@@ -430,10 +453,11 @@ const launchEditorProcess = Effect.fn("externalLauncher.launchEditorProcess")(fu
   );
 });
 
-export const make = Effect.gen(function* () {
+export const make = Effect.fn("externalLauncher.make")(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
+  const lastKnownEditors = yield* Ref.make<ReadonlyArray<EditorId>>([]);
 
   const provideCommandResolutionServices = <A, E, R>(
     effect: Effect.Effect<A, E, R | FileSystem.FileSystem | Path.Path>,
@@ -443,8 +467,28 @@ export const make = Effect.gen(function* () {
       Effect.provideService(Path.Path, path),
     );
 
+  const discoverAndRememberEditors = Effect.fn("externalLauncher.discoverAndRememberEditors")(
+    function* () {
+      const discovery = yield* provideCommandResolutionServices(resolveAvailableEditors());
+      const editors = discovery.complete
+        ? discovery.editors
+        : mergeEditorLists(discovery.editors, yield* Ref.get(lastKnownEditors));
+
+      yield* Ref.set(lastKnownEditors, editors);
+      return { editors, complete: discovery.complete };
+    },
+  );
+
+  const discoveryCache = yield* Cache.makeWith(() => discoverAndRememberEditors(), {
+    capacity: 1,
+    timeToLive: Exit.match({
+      onSuccess: ({ complete }) => (complete ? EDITOR_DISCOVERY_CACHE_TTL : Duration.zero),
+      onFailure: () => Duration.zero,
+    }),
+  });
+
   return ExternalLauncher.of({
-    resolveAvailableEditors: () => provideCommandResolutionServices(resolveAvailableEditors()),
+    resolveAvailableEditors: () => Cache.get(discoveryCache, EDITOR_DISCOVERY_CACHE_KEY),
     launchBrowser: (target) =>
       launchBrowser(target).pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
@@ -460,4 +504,4 @@ export const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(ExternalLauncher, make);
+export const layer = Layer.effect(ExternalLauncher, make());

@@ -1,13 +1,21 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
 import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
+import * as TestClock from "effect/testing/TestClock";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   extractPathFromShellOutput,
   CommandAvailability,
   type CommandAvailabilityChecker,
+  discoverAvailableCommands,
   isCommandAvailable,
   listLoginShellCandidates,
   mergePathEntries,
@@ -350,6 +358,239 @@ effectIt.layer(NodeServices.layer)("isCommandAvailable", (it) => {
           env: { PATH: "", PATHEXT: ".COM;.EXE;.BAT;.CMD" },
         }).pipe(Effect.provideService(HostProcessPlatform, "win32")),
       ).toBe(false);
+    }),
+  );
+});
+
+effectIt.layer(NodeServices.layer)("discoverAvailableCommands", (it) => {
+  it.effect("uses the provided host environment for Windows discovery", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const binDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-commands-" });
+
+      yield* fileSystem.writeFileString(path.join(binDir, "code.CMD"), "@echo off\r\n");
+
+      const discovery = yield* discoverAvailableCommands(["code"], {
+        timeout: Duration.seconds(3),
+      }).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provideService(HostProcessEnvironment, {
+          PATH: binDir,
+          PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        }),
+      );
+
+      expect(discovery.complete).toBe(true);
+      expect(Array.from(discovery.available)).toEqual(["code"]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps Windows command aliases that resolve to the same executable", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const binDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-commands-" });
+
+      yield* fileSystem.writeFileString(path.join(binDir, "foo.CMD"), "@echo off\r\n");
+
+      const discovery = yield* discoverAvailableCommands(["foo", "foo.cmd"], {
+        env: {
+          PATH: binDir,
+          PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        },
+        timeout: Duration.seconds(3),
+      }).pipe(Effect.provideService(HostProcessPlatform, "win32"));
+
+      expect(discovery.complete).toBe(true);
+      expect(Array.from(discovery.available)).toEqual(["foo", "foo.cmd"]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("keeps validated Windows matches when another PATH entry times out", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const binDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-commands-" });
+      const stalledPath = path.join(binDir, "stalled");
+      const responsiveMatchValidated = yield* Deferred.make<void>();
+
+      yield* fileSystem.writeFileString(path.join(binDir, "code.CMD"), "@echo off\r\n");
+      yield* fileSystem.makeDirectory(path.join(binDir, "fake.CMD"));
+
+      const testFileSystem = FileSystem.FileSystem.of({
+        ...fileSystem,
+        readDirectory: (directory, options) =>
+          directory === stalledPath ? Effect.never : fileSystem.readDirectory(directory, options),
+        stat: (entry) =>
+          fileSystem
+            .stat(entry)
+            .pipe(
+              Effect.tap(() =>
+                entry === path.join(binDir, "code.CMD")
+                  ? Deferred.succeed(responsiveMatchValidated, undefined)
+                  : Effect.void,
+              ),
+            ),
+      });
+
+      const discoveryFiber = yield* discoverAvailableCommands(["code", "fake"], {
+        env: {
+          PATH: `${binDir};${stalledPath}`,
+          PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        },
+        timeout: Duration.seconds(3),
+      }).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provideService(FileSystem.FileSystem, testFileSystem),
+        Effect.forkScoped,
+      );
+
+      yield* Deferred.await(responsiveMatchValidated);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(Duration.seconds(3));
+
+      const discovery = yield* Fiber.join(discoveryFiber);
+      expect(discovery.complete).toBe(false);
+      expect(Array.from(discovery.available)).toEqual(["code"]);
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("bounds concurrent Windows PATH directory reads", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const firstBatchStarted = yield* Deferred.make<void>();
+      let startedReads = 0;
+
+      const testFileSystem = FileSystem.FileSystem.of({
+        ...fileSystem,
+        readDirectory: () =>
+          Effect.sync(() => {
+            startedReads += 1;
+            return startedReads === 8;
+          }).pipe(
+            Effect.flatMap((batchStarted) =>
+              batchStarted ? Deferred.succeed(firstBatchStarted, undefined) : Effect.void,
+            ),
+            Effect.andThen(Effect.never),
+          ),
+      });
+
+      const discoveryFiber = yield* discoverAvailableCommands(["code"], {
+        env: {
+          PATH: Array.from({ length: 20 }, (_, index) => `C:\\slow-${index}`).join(";"),
+          PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        },
+        timeout: Duration.seconds(3),
+      }).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provideService(FileSystem.FileSystem, testFileSystem),
+        Effect.forkScoped,
+      );
+
+      yield* Deferred.await(firstBatchStarted);
+      yield* TestClock.adjust(Duration.seconds(3));
+
+      const discovery = yield* Fiber.join(discoveryFiber);
+      expect(discovery.complete).toBe(false);
+      expect(startedReads).toBe(8);
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("bounds concurrent portable command probes", () =>
+    Effect.gen(function* () {
+      const firstBatchStarted = yield* Deferred.make<void>();
+      let startedProbes = 0;
+
+      const discoveryFiber = yield* discoverAvailableCommands(
+        Array.from({ length: 40 }, (_, index) => `command-${index}`),
+        {
+          env: { PATH: "/bin" },
+          timeout: Duration.seconds(3),
+        },
+      ).pipe(
+        Effect.provideService(HostProcessPlatform, "linux"),
+        Effect.provideService(CommandAvailability, () =>
+          Effect.sync(() => {
+            startedProbes += 1;
+            return startedProbes === 32;
+          }).pipe(
+            Effect.flatMap((batchStarted) =>
+              batchStarted ? Deferred.succeed(firstBatchStarted, undefined) : Effect.void,
+            ),
+            Effect.andThen(Effect.never),
+          ),
+        ),
+        Effect.forkScoped,
+      );
+
+      yield* Deferred.await(firstBatchStarted);
+      yield* TestClock.adjust(Duration.seconds(3));
+
+      const discovery = yield* Fiber.join(discoveryFiber);
+      expect(discovery.complete).toBe(false);
+      expect(startedProbes).toBe(32);
+    }).pipe(Effect.scoped, Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("marks non-NotFound Windows filesystem failures as incomplete", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const options = {
+        env: {
+          PATH: "C:\\bin",
+          PATHEXT: ".COM;.EXE;.BAT;.CMD",
+        },
+        timeout: Duration.seconds(3),
+      } as const;
+      const missingError = PlatformError.systemError({
+        _tag: "NotFound",
+        module: "FileSystem",
+        method: "readDirectory",
+        pathOrDescriptor: "C:\\bin",
+      });
+      const permissionDenied = PlatformError.systemError({
+        _tag: "PermissionDenied",
+        module: "FileSystem",
+        method: "readDirectory",
+        pathOrDescriptor: "C:\\bin",
+      });
+
+      const missingPath = yield* discoverAvailableCommands(["code"], options).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provideService(
+          FileSystem.FileSystem,
+          FileSystem.FileSystem.of({
+            ...fileSystem,
+            readDirectory: () => Effect.fail(missingError),
+          }),
+        ),
+      );
+      const deniedPath = yield* discoverAvailableCommands(["code"], options).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provideService(
+          FileSystem.FileSystem,
+          FileSystem.FileSystem.of({
+            ...fileSystem,
+            readDirectory: () => Effect.fail(permissionDenied),
+          }),
+        ),
+      );
+      const deniedStat = yield* discoverAvailableCommands(["code"], options).pipe(
+        Effect.provideService(HostProcessPlatform, "win32"),
+        Effect.provideService(
+          FileSystem.FileSystem,
+          FileSystem.FileSystem.of({
+            ...fileSystem,
+            readDirectory: () => Effect.succeed(["code.CMD"]),
+            stat: () => Effect.fail(permissionDenied),
+          }),
+        ),
+      );
+
+      expect(missingPath.complete).toBe(true);
+      expect(deniedPath.complete).toBe(false);
+      expect(deniedStat.complete).toBe(false);
     }),
   );
 });

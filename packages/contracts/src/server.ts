@@ -428,6 +428,7 @@ export const ServerConfig = Schema.Struct({
   // Editor ids grow over time; drop ones this build does not know rather than
   // failing the whole config decode.
   availableEditors: ForwardCompatibleArray(EditorId),
+  availableEditorsComplete: Schema.optionalKey(Schema.Boolean),
   observability: ServerObservability,
   settings: ServerSettings,
   /** Whether shell subscriptions can emit an opt-in catch-up completion marker. */

@@ -44,6 +44,8 @@ import {
   type RelayClientInstallProgressEvent,
   type ServerSelfUpdateError,
   type ServerSelfUpdateProgressEvent,
+  type ServerConfig as ServerConfigValue,
+  type ServerConfigStreamEvent,
   type FilesystemBrowseFailure,
   FilesystemBrowseError,
   AssetWorkspaceContextNotFoundError,
@@ -125,14 +127,73 @@ const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchComma
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const EDITOR_DISCOVERY_TIMEOUT = Duration.seconds(5);
+const EDITOR_DISCOVERY_RETRY_DELAY = Duration.seconds(1);
 
-export const resolveAvailableEditorsForConfig = <A, E, R>(
-  discovery: Effect.Effect<ReadonlyArray<A>, E, R>,
+export const resolveAvailableEditorsForConfig = <E, R>(
+  discovery: Effect.Effect<ExternalLauncher.EditorDiscoveryResult, E, R>,
 ) =>
   discovery.pipe(
     Effect.timeoutOption(EDITOR_DISCOVERY_TIMEOUT),
-    Effect.map(Option.getOrElse(() => [])),
+    Effect.map(
+      Option.getOrElse(
+        (): ExternalLauncher.EditorDiscoveryResult => ({
+          editors: [],
+          complete: false,
+        }),
+      ),
+    ),
   );
+
+type ServerConfigIncrementalEvent = Exclude<ServerConfigStreamEvent, { readonly type: "snapshot" }>;
+
+interface EditorDiscoveryRetryEvent {
+  readonly type: "editorDiscoveryRetried";
+  readonly discovery: ExternalLauncher.EditorDiscoveryResult;
+}
+
+function projectServerConfigLiveEvent(
+  config: ServerConfigValue,
+  event: ServerConfigIncrementalEvent | EditorDiscoveryRetryEvent,
+): readonly [ServerConfigValue, ReadonlyArray<ServerConfigStreamEvent>] {
+  let next: ServerConfigValue;
+  switch (event.type) {
+    case "editorDiscoveryRetried":
+      next = {
+        ...config,
+        availableEditors: event.discovery.editors,
+        availableEditorsComplete: event.discovery.complete,
+      };
+      break;
+    case "keybindingsUpdated":
+      next = {
+        ...config,
+        keybindings: event.payload.keybindings,
+        issues: event.payload.issues,
+      };
+      break;
+    case "providerStatuses":
+      next = {
+        ...config,
+        providers: event.payload.providers,
+      };
+      break;
+    case "settingsUpdated":
+      next = {
+        ...config,
+        settings: event.payload.settings,
+      };
+      break;
+  }
+  const output: ServerConfigStreamEvent =
+    event.type === "editorDiscoveryRetried"
+      ? {
+          version: 1,
+          type: "snapshot",
+          config: next,
+        }
+      : event;
+  return [next, [output]];
+}
 
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
@@ -985,6 +1046,9 @@ const makeWsRpcLayer = (
         );
         const environment = yield* serverEnvironment.getDescriptor;
         const auth = yield* serverAuth.getDescriptor();
+        const editorDiscovery = yield* resolveAvailableEditorsForConfig(
+          externalLauncher.resolveAvailableEditors(),
+        );
 
         return {
           environment,
@@ -994,9 +1058,8 @@ const makeWsRpcLayer = (
           keybindings: keybindingsConfig.keybindings,
           issues: keybindingsConfig.issues,
           providers,
-          availableEditors: yield* resolveAvailableEditorsForConfig(
-            externalLauncher.resolveAvailableEditors(),
-          ),
+          availableEditors: editorDiscovery.editors,
+          availableEditorsComplete: editorDiscovery.complete,
           observability: {
             logsDirectoryPath: config.logsDir,
             localTracingEnabled: true,
@@ -2031,16 +2094,33 @@ const makeWsRpcLayer = (
                 .refresh()
                 .pipe(Effect.ignoreCause({ log: true }), Effect.forkScoped);
 
+              const initialConfig = yield* loadServerConfig;
+              const editorDiscoveryRetry =
+                initialConfig.availableEditorsComplete === false
+                  ? Stream.fromEffect(
+                      Effect.sleep(EDITOR_DISCOVERY_RETRY_DELAY).pipe(
+                        Effect.andThen(
+                          resolveAvailableEditorsForConfig(
+                            externalLauncher.resolveAvailableEditors(),
+                          ),
+                        ),
+                        Effect.map((discovery) => ({
+                          type: "editorDiscoveryRetried" as const,
+                          discovery,
+                        })),
+                      ),
+                    )
+                  : Stream.empty;
               const liveUpdates = Stream.merge(
-                keybindingsUpdates,
-                Stream.merge(providerStatuses, settingsUpdates),
-              );
+                editorDiscoveryRetry,
+                Stream.merge(keybindingsUpdates, Stream.merge(providerStatuses, settingsUpdates)),
+              ).pipe(Stream.mapAccum(() => initialConfig, projectServerConfigLiveEvent));
 
               return Stream.concat(
                 Stream.make({
                   version: 1 as const,
                   type: "snapshot" as const,
-                  config: yield* loadServerConfig,
+                  config: initialConfig,
                 }),
                 liveUpdates,
               );
